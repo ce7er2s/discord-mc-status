@@ -86,7 +86,7 @@ func main() {
 	commands := []*discordgo.ApplicationCommand{
 		{
 			Name:        "about",
-			Description: fmt.Sprintf("Tracking server status at %s:%i", *mcAddress, *mcPort),
+			Description: "Minecraft server details",
 		},
 	}
 
@@ -96,7 +96,7 @@ func main() {
 			err := s.InteractionRespond(m.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{
-					Content: "aboutme message",
+					Content: fmt.Sprintf("Tracking server status at %s:%d", *mcAddress, *mcPort),
 				},
 			})
 
