@@ -1,0 +1,9 @@
+services:
+  app:
+    build: .
+    environment:
+      LOG_LEVEL: debug
+      MC_ADDR: ""
+      MC_PORT: 25565
+      DISCORD_TOKEN: ""       # set your discord token here or set to ${DISCORD_TOKEN} to get from env
+    restart: unless-stopped
