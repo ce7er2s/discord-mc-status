@@ -12,10 +12,11 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/charmbracelet/log"
+	"github.com/ce7er2s/discord-mc-status/pkg/command"
+	"github.com/ce7er2s/discord-mc-status/pkg/config"
+	"github.com/ce7er2s/discord-mc-status/pkg/status"
 
-	"github.com/mcstatus-io/mcutil/v4/response"
-	"github.com/mcstatus-io/mcutil/v4/status"
+	clog "github.com/charmbracelet/log"
 )
 
 func getenv[T string | int](k string, def T) T {
@@ -28,20 +29,28 @@ func getenv[T string | int](k string, def T) T {
 	if _, isInt := any(def).(int); isInt {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			log.Fatalf("bad %s=%q: %v", k, v, err)
+			clog.Fatalf("bad %s=%q: %v", k, v, err)
 		}
 		out = n
 	}
 	return out.(T)
 }
 
+// TODO: normal flags
+
 var (
-	mcAddress      = flag.String("address", getenv("MC_ADDR", "127.0.0.1"), "address to monitor")
-	mcPort         = flag.Int("port", getenv("MC_PORT", 25565), "explicit port to connect to")
-	removeCommands = flag.Bool("rmcmd", true, "remove registered slash commands after shutdown")
+	mcAddress             = flag.String("address", getenv("MC_ADDR", "127.0.0.1"), "address to monitor")
+	mcPort                = flag.Int("port", getenv("MC_PORT", 25565), "explicit port to connect to")
+	removeCommands        = flag.Bool("rm", true, "remove registered slash commands after shutdown")
+	statusUpdateInterval  = flag.Duration("update-interval", time.Second*10, "online status update interval")
+	serverTimeoutInterval = flag.Duration("server-timeout", time.Second*5, "server response timeout")
+
+	l   *clog.Logger
+	cfg *config.Config
 )
 
-func main() {
+func init() {
+
 	flag.Parse()
 
 	var logFile io.Writer
@@ -50,19 +59,29 @@ func main() {
 		logFile = io.Discard
 	}
 
-	var logLevel log.Level = log.DebugLevel
+	var logLevel clog.Level = clog.DebugLevel
 	if v, ok := os.LookupEnv("LOG_LEVEL"); ok {
-		level, err := log.ParseLevel(v)
+		level, err := clog.ParseLevel(v)
 		if err != nil {
 			logLevel = level
 		}
 	}
 
-	l := log.NewWithOptions(io.MultiWriter(os.Stdout, logFile), log.Options{
+	l = clog.NewWithOptions(io.MultiWriter(os.Stdout, logFile), clog.Options{
 		ReportTimestamp: true,
 		ReportCaller:    true,
 		Level:           logLevel,
 	})
+
+	cfg = &config.Config{
+		Address:         *mcAddress,
+		Port:            *mcPort,
+		UpdateInterval:  *statusUpdateInterval,
+		TimeoutInterval: *serverTimeoutInterval,
+	}
+}
+
+func main() {
 
 	discordToken, ok := os.LookupEnv("DISCORD_TOKEN")
 	if !ok {
@@ -83,108 +102,22 @@ func main() {
 	}
 	defer discord.Close()
 
-	commands := []*discordgo.ApplicationCommand{
-		{
-			Name:        "about",
-			Description: "Minecraft server details",
-		},
-	}
+	dispatcher := command.NewDispatcher(l, cfg, discord)
 
-	commandHandlers := map[string]func(*discordgo.Session, *discordgo.InteractionCreate){
-		"about": func(s *discordgo.Session, m *discordgo.InteractionCreate) {
-			l.Debugf("dispatched to \"about\" handler")
-			err := s.InteractionRespond(m.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{
-					Content: fmt.Sprintf("Tracking server status at %s:%d", *mcAddress, *mcPort),
-				},
-			})
+	discord.AddHandler(dispatcher.CreateCommandHandler())
 
-			if err != nil {
-				l.Errorf("can't proceed interaction \"about\": %v", err)
-			}
-		},
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	var registeredCommands []*discordgo.ApplicationCommand
-	for _, command := range commands {
-		cmd, err := discord.ApplicationCommandCreate(discord.State.User.ID, "", command)
-		if err != nil {
-			l.Errorf("interaction \"%s\" registration failed: %v", command.Name)
-		} else {
-			registeredCommands = append(registeredCommands, cmd)
-		}
-	}
+	go status.UpdateOnlineStatus(ctx, l, cfg, discord)
 
-	discord.AddHandler(func(s *discordgo.Session, m *discordgo.InteractionCreate) {
-		cmd := m.ApplicationCommandData().Name
-		l.Debugf("got interaction \"%s\", dispatching...", cmd)
-		if handler, ok := commandHandlers[cmd]; ok {
-			handler(s, m)
-		}
-	})
-
-	sc := make(chan os.Signal, 1)
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-
-		cancel := context.CancelFunc(func() {})
-		defer func() { cancel() }()
-
-		for {
-			select {
-			case <-sc:
-				return
-			case t := <-ticker.C:
-				ctx, cancel := context.WithDeadline(context.Background(), t.Add(5*time.Second))
-				resp, err := fetchMcServerStatus(ctx, *mcAddress, int64(*mcPort))
-				cancel()
-
-				<-ctx.Done()
-
-				var status string
-				if err != nil {
-					status = "Status: 🔴 offline"
-				} else {
-					status = createStatusString(resp)
-				}
-
-				err = discord.UpdateCustomStatus(status)
-				if err != nil {
-					l.Errorf("can't update status: %v", err)
-				}
-			}
-		}
-	}()
-
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	fmt.Println("Bot is now running.  Press CTRL-C to exit.")
-	<-sc
+
+	<-ctx.Done()
 
 	l.Info("bot stopped. cleaning up...")
 
 	if *removeCommands {
-		l.Info("removing commands...")
-
-		for _, command := range registeredCommands {
-			err := discord.ApplicationCommandDelete(discord.State.User.ID, "", command.ID)
-			if err != nil {
-				l.Errorf("cannot delete '%v' command: %v", command.Name, err)
-			}
-		}
+		dispatcher.Delete()
 	}
-}
-
-func fetchMcServerStatus(ctx context.Context, address string, port int64) (*response.StatusModern, error) {
-	response, err := status.Modern(ctx, address, uint16(port))
-	if err != nil {
-		return nil, err
-	}
-
-	return response, err
-}
-
-func createStatusString(status *response.StatusModern) string {
-	return fmt.Sprintf("Status: 🟢 online (%d / %d players)", *status.Players.Online, *status.Players.Max)
 }
